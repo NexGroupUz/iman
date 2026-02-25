@@ -23,7 +23,6 @@ final class BitrixClient
         $raw = curl_exec($ch);
         $err = curl_error($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         if ($raw === false) {
             throw new RuntimeException("Bitrix curl error: {$err}");
@@ -51,5 +50,18 @@ final class BitrixClient
     {
         $r = $this->call("crm.contact.get", ["id" => $contactId]);
         return $r["result"] ?? [];
+    }
+    public function getUser(int $userId): array
+    {
+        // user.get обычно возвращает массив пользователей
+        $r = $this->call("user.get", [
+            "FILTER" => ["ID" => $userId],
+        ]);
+
+        $list = $r["result"] ?? [];
+        if (is_array($list) && isset($list[0]) && is_array($list[0])) {
+            return $list[0];
+        }
+        return [];
     }
 }

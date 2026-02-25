@@ -24,6 +24,7 @@ final class Worker
             $resp = $tel->history(
                 self::utcFmt($start),
                 self::utcFmt($end),
+                $phoneDigits,
                 "all",
                 $pageSize,
                 $page,
@@ -65,69 +66,79 @@ final class Worker
 
     public function tick(): void
     {
-        $this->db->tx(function (PDO $pdo) {
-            $repo = new QueueRepo($pdo);
+        $timeoutSec = Config::int("TEL_WEBHOOK_TIMEOUT_SEC", 30);
 
-            // A) закрываем waiting_result (если используете)
-            $row = $repo->lockNextWaitingResult();
+        $this->db->tx(function (PDO $pdo) use ($timeoutSec) {
+            $repo = new QueueRepo($pdo);
+            $repo->releaseExpiredLocks();
+
+            /**
+             * A) Таймаут ожидания вебхука:
+             * если задача висит в waiting_webhook и scheduled_at <= NOW()
+             * значит финальный history не пришёл в пределах SLA -> считаем как “не дозвонились”
+             */
+            $row = $repo->lockNextWebhookTimeout();
             if ($row) {
                 $id = (int) $row["id"];
-                $phone = (string) $row["phone"];
+                $attempts = (int) $row["dial_attempts"];
+                $pbxUser = (string) ($row["pbx_user"] ?? "");
 
-                // упрощённо: только проверяем успех (локально/по истории) и закрываем
-                $ok =
-                    $repo->hasLocalSuccess($phone) ||
-                    $this->hasSuccessfulCallFallback($this->tel, $phone);
-
-                $repo->addAttempt(
-                    $id,
-                    (int) $row["dial_attempts"],
-                    "history_check",
-                    $ok,
-                    $ok ? "success found" : "not found",
-                );
-                if ($ok) {
-                    $repo->markDone($id, "done_success");
+                if ($attempts >= 3) {
+                    $repo->markDone(
+                        $id,
+                        "failed",
+                        "webhook timeout, attempts exhausted",
+                    );
+                    $repo->addAttempt(
+                        $id,
+                        $attempts,
+                        "webhook_timeout_giveup",
+                        true,
+                        "timeout",
+                    );
                 } else {
-                    // если за разумное время не нашли — считаем неответом и планируем retry +10 мин
-                    $attemptNo = (int) $row["dial_attempts"] + 1;
-                    if ($attemptNo >= 3) {
-                        $repo->markDone(
+                    if ($pbxUser !== "") {
+                        $when = $repo->rescheduleAtManagerTail(
                             $id,
-                            "failed",
-                            "no success after attempts",
+                            $pbxUser,
+                            60, // 1 минута
+                            "retry",
+                            "webhook timeout",
+                            true, // postpones++
                         );
                         $repo->addAttempt(
                             $id,
-                            $attemptNo,
-                            "giveup",
+                            $attempts,
+                            "webhook_timeout_retry",
                             true,
-                            "attempts exhausted",
+                            "retry_at=" . $when->format("Y-m-d H:i:s"),
                         );
                     } else {
-                        $when = new DateTimeImmutable("+10 minutes");
+                        // fallback
                         $repo->reschedule(
                             $id,
                             "retry",
-                            $when,
-                            "no answer / dropped",
-                            true,
+                            new DateTimeImmutable("+1 minutes"),
+                            "webhook timeout",
+                            false,
                             true,
                         );
                         $repo->addAttempt(
                             $id,
-                            $attemptNo,
-                            "postpone_noanswer",
+                            $attempts,
+                            "webhook_timeout_retry",
                             true,
-                            "retry +10min",
+                            "retry +1min",
                         );
                     }
                 }
-                return; // 1 действие за тик — проще и предсказуемее
+                return;
             }
 
-            // B) берём следующую задачу по priority gate
-            $row = $repo->lockNextByPriorityGate();
+            /**
+             * B) Берём следующую задачу по priority gate
+             */
+            $row = $repo->lockNextByPriorityGate(); // должен выбирать только pending/retry и scheduled_at<=NOW
             if (!$row) {
                 return;
             }
@@ -136,86 +147,87 @@ final class Worker
             $phone = (string) $row["phone"];
             $pbxUser = (string) ($row["pbx_user"] ?? "");
 
-            if ($pbxUser === "") {
-                $repo->markDone($id, "failed", "pbx_user not mapped");
+            if ($pbxUser === "" || $phone === "" || $phone === "0") {
+                $repo->markDone($id, "failed", "missing pbx_user or phone");
                 $repo->addAttempt(
                     $id,
                     (int) $row["dial_attempts"],
-                    "makecall",
+                    "precheck",
                     false,
-                    "missing pbx_user",
+                    "missing pbx_user/phone",
                 );
                 return;
             }
 
-            // 1) уже был успешный звонок? тогда пропускаем
+            // 1) если уже был успешный звонок для этого телефона — закрываем и не звоним
             $already =
                 $repo->hasLocalSuccess($phone) ||
                 $this->hasSuccessfulCallFallback($this->tel, $phone);
             if ($already) {
-                $repo->markDone($id, "done_skipped_success");
+                $repo->markDone(
+                    $id,
+                    "done_skipped_success",
+                    "local success cache",
+                );
                 $repo->addAttempt(
                     $id,
                     (int) $row["dial_attempts"],
                     "skip_success",
                     true,
-                    "already had successful call",
+                    "local cache",
                 );
                 return;
             }
 
-            // 2) инициируем звонок
-            try {
-                $resp = $this->tel->makeCall($pbxUser, $phone);
+            // 2) лимит попыток: dial_attempts считаем попытками дозвона
+            $attemptNo = (int) $row["dial_attempts"] + 1;
+            if ($attemptNo > 3) {
+                $repo->markDone($id, "failed", "attempts exhausted");
                 $repo->addAttempt(
                     $id,
-                    (int) $row["dial_attempts"] + 1,
+                    (int) $row["dial_attempts"],
+                    "giveup",
+                    true,
+                    "attempts exhausted",
+                );
+                return;
+            }
+
+            // 3) инициируем звонок
+            try {
+                $resp = $this->tel->makeCall($pbxUser, $phone);
+
+                // достаём callid из ответа (варианты на практике отличаются)
+                $callid =
+                    (string) ($resp["callid"] ?? "") ?:
+                    (string) ($resp["data"]["callid"] ?? "") ?:
+                    (string) ($resp["result"]["callid"] ?? "");
+
+                $deadline = new DateTimeImmutable("now")->modify(
+                    "+{$timeoutSec} seconds",
+                );
+
+                if ($callid === "") {
+                    throw new RuntimeException(
+                        "makeCall returned without callid: " .
+                            json_encode($resp, JSON_UNESCAPED_UNICODE),
+                    );
+                }
+
+                // фиксируем попытку и переводим в ожидание вебхука
+                $repo->setDialStarted($id, $attemptNo, $callid, $deadline);
+
+                $repo->addAttempt(
+                    $id,
+                    $attemptNo,
                     "makecall",
                     true,
                     json_encode($resp, JSON_UNESCAPED_UNICODE),
                 );
-
-                // 3) ставим в ожидание результата (через 30 сек проверим историю)
-                $repo->reschedule(
-                    $id,
-                    "waiting_result",
-                    new DateTimeImmutable("+30 seconds"),
-                    null,
-                    true,
-                    false,
-                );
-                $st = $pdo->prepare(
-                    "UPDATE call_queue SET last_dial_at=NOW() WHERE id=?",
-                );
-                $st->execute([$id]);
             } catch (Throwable $e) {
                 $msg = $e->getMessage();
-                $lower = strtolower($msg);
 
-                // busy/dnd => +1 мин, не считаем попыткой дозвона
-                if (
-                    str_contains($lower, "busy") ||
-                    str_contains($lower, "dnd")
-                ) {
-                    $repo->reschedule(
-                        $id,
-                        "retry",
-                        new DateTimeImmutable("+1 minute"),
-                        $msg,
-                        false,
-                        true,
-                    );
-                    $repo->addAttempt(
-                        $id,
-                        (int) $row["dial_attempts"],
-                        "postpone_busy",
-                        true,
-                        $msg,
-                    );
-                    return;
-                }
-
-                // прочие ошибки: +1 мин, но лучше ограничить количеством postpones/attempts
+                // ошибка makecall: отложим на 1 минуту (считай как временная)
                 $repo->reschedule(
                     $id,
                     "retry",
@@ -227,7 +239,7 @@ final class Worker
                 $repo->addAttempt(
                     $id,
                     (int) $row["dial_attempts"],
-                    "makecall",
+                    "makecall_error",
                     false,
                     $msg,
                 );

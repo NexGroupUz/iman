@@ -42,7 +42,6 @@ final class TelephonyClient
         $raw = curl_exec($ch);
         $err = curl_error($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         if ($raw === false) {
             throw new RuntimeException("Telephony curl error: {$err}");
@@ -67,6 +66,7 @@ final class TelephonyClient
      */
     public function makeCall(string $userExt, string $phoneDigits): array
     {
+        echo "makeCall: Operator($userExt) Client ($phoneDigits)" . PHP_EOL;
         return $this->req("POST", "/crmapi/v1/makecall", [
             "user" => $userExt,
             "phone" => $phoneDigits,
@@ -80,6 +80,7 @@ final class TelephonyClient
     public function history(
         string $startUtc,
         string $endUtc,
+        string $client,
         string $type = "all",
         int $pageSize = 200,
         int $pageNumber = 1,
@@ -90,6 +91,7 @@ final class TelephonyClient
             "type" => $type,
             "pageSize" => $pageSize,
             "pageNumber" => $pageNumber,
+            "client" => $client,
         ]);
     }
 }

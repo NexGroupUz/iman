@@ -1,4 +1,8 @@
 <?php
+ini_set("log_errors", "1");
+ini_set("error_log", __DIR__ . "/../logs/worker.log"); // поправь путь для bin/*
+error_reporting(E_ALL);
+
 require_once __DIR__ . "/../src/Config.php";
 require_once __DIR__ . "/../src/Db.php";
 require_once __DIR__ . "/../src/TelephonyClient.php";

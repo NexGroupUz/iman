@@ -22,11 +22,12 @@ final class QueueRepo
     public function enqueue(array $row): int
     {
         $st = $this->pdo->prepare("
-      INSERT INTO call_queue(
-        contact_id, deal_id, stage_id, bitrix_user_id, pbx_user,
-        phone, score, stage_priority, event_ts, scheduled_at, status
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    ");
+          INSERT INTO call_queue(
+            contact_id, deal_id, stage_id, bitrix_user_id, pbx_user,
+            phone, score, stage_priority, event_ts, planned_at, scheduled_at, status
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        ");
+
         $st->execute([
             $row["contact_id"],
             $row["deal_id"],
@@ -37,7 +38,8 @@ final class QueueRepo
             $row["score"],
             $row["stage_priority"],
             $row["event_ts"],
-            $row["scheduled_at"],
+            $row["scheduled_at"], // planned_at = первое расписание (+5 минут)
+            $row["scheduled_at"], // scheduled_at = когда реально исполнить
             $row["status"],
         ]);
 
@@ -50,7 +52,7 @@ final class QueueRepo
         SET status='superseded', superseded_by=?, scheduled_at=scheduled_at
         WHERE id <> ?
           AND contact_id = ?
-          AND status IN ('pending','retry','locked','waiting_result')
+          AND status IN ('pending','retry','locked','waiting_webhook')
       ");
             $st2->execute([$newId, $newId, $row["contact_id"]]);
         } else {
@@ -59,7 +61,7 @@ final class QueueRepo
         SET status='superseded', superseded_by=?
         WHERE id <> ?
           AND phone = ?
-          AND status IN ('pending','retry','locked','waiting_result')
+          AND status IN ('pending','retry','locked','waiting_webhook')
       ");
             $st2->execute([$newId, $newId, $row["phone"]]);
         }
@@ -102,29 +104,6 @@ final class QueueRepo
 
         $st = $this->pdo->prepare($sql);
         $st->execute([$status, $when->format("Y-m-d H:i:s"), $err, $id]);
-    }
-
-    public function lockNextWaitingResult(): ?array
-    {
-        // простая стратегия: берём один waiting_result по времени
-        $st = $this->pdo->prepare("
-      SELECT * FROM call_queue
-      WHERE status='waiting_result' AND scheduled_at <= NOW()
-      ORDER BY scheduled_at ASC, id ASC
-      LIMIT 1
-      FOR UPDATE
-    ");
-        $st->execute();
-        $row = $st->fetch();
-        if (!$row) {
-            return null;
-        }
-
-        $st2 = $this->pdo->prepare(
-            "UPDATE call_queue SET status='locked', locked_until=DATE_ADD(NOW(), INTERVAL 30 SECOND) WHERE id=?",
-        );
-        $st2->execute([(int) $row["id"]]);
-        return $row;
     }
 
     public function lockNextByPriorityGate(): ?array
@@ -183,5 +162,157 @@ final class QueueRepo
       ON DUPLICATE KEY UPDATE last_success_at=VALUES(last_success_at)
     ");
         $st->execute([$phone, $dt->format("Y-m-d H:i:s")]);
+    }
+
+    public function findActiveByCallId(string $callid): ?array
+    {
+        $st = $this->pdo->prepare("
+            SELECT * FROM call_queue
+            WHERE callid = ?
+              AND status IN ('waiting_webhook','pending','retry','locked')
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $st->execute([$callid]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
+    public function decrementDialAttemptsSafe(int $id): void
+    {
+        $st = $this->pdo->prepare("
+            UPDATE call_queue
+               SET dial_attempts = IF(dial_attempts>0, dial_attempts-1, 0),
+                   updated_at=NOW()
+             WHERE id=?
+        ");
+        $st->execute([$id]);
+    }
+
+    /**
+     * Должен лочить одну задачу, у которой истёк дедлайн вебхука
+     */
+    public function lockNextWebhookTimeout(): ?array
+    {
+        $st = $this->pdo->prepare("
+             SELECT * FROM call_queue
+             WHERE status='waiting_webhook'
+               AND webhook_deadline_at IS NOT NULL
+               AND webhook_deadline_at <= NOW()
+             ORDER BY webhook_deadline_at ASC
+             LIMIT 1
+             FOR UPDATE
+         ");
+        $st->execute();
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    public function setDialStarted(
+        int $id,
+        int $attemptNo,
+        string $callid,
+        DateTimeImmutable $webhookDeadline,
+    ): void {
+        $st = $this->pdo->prepare("
+            UPDATE call_queue
+               SET dial_attempts=?,
+                   callid=?,
+                   dial_started_at=NOW(),
+                   webhook_deadline_at=?,
+                   scheduled_at=?,      -- next run = дедлайн вебхука
+                   last_dial_at=NOW(),
+                   status='waiting_webhook',
+                   locked_until=NULL
+             WHERE id=?
+        ");
+        $deadlineStr = $webhookDeadline->format("Y-m-d H:i:s");
+        $st->execute([
+            $attemptNo,
+            $callid !== "" ? $callid : null,
+            $deadlineStr,
+            $deadlineStr,
+            $id,
+        ]);
+    }
+    public function markWebhookReceived(int $id): void
+    {
+        $st = $this->pdo->prepare(
+            "UPDATE call_queue SET last_webhook_at=NOW() WHERE id=?",
+        );
+        $st->execute([$id]);
+    }
+
+    public function releaseExpiredLocks(): int
+    {
+        $st = $this->pdo->prepare("
+            UPDATE call_queue
+               SET status='retry', locked_until=NULL
+             WHERE status='locked'
+               AND locked_until IS NOT NULL
+               AND locked_until < NOW()
+        ");
+        $st->execute();
+        return $st->rowCount();
+    }
+
+    /**
+     * Вернуть время "после хвоста очереди менеджера", с gap (например 10 минут).
+     * active statuses: pending, retry, waiting_webhook, locked
+     */
+    public function calcTailAfter(
+        string $pbxUser,
+        DateTimeImmutable $base,
+        int $gapSeconds,
+        int $excludeId,
+    ): DateTimeImmutable {
+        $st = $this->pdo->prepare("
+            SELECT MAX(scheduled_at) AS mx
+              FROM call_queue
+             WHERE pbx_user = ?
+               AND id <> ?
+               AND status IN ('pending','retry','locked')
+        ");
+        $st->execute([$pbxUser, $excludeId]);
+        $mx = $st->fetchColumn();
+
+        $tail = null;
+        if (is_string($mx) && $mx !== "") {
+            $tail = new DateTimeImmutable($mx);
+        }
+
+        $cand1 = $base;
+        if ($tail) {
+            $cand2 = $tail->modify("+{$gapSeconds} seconds");
+            return $cand2 > $cand1 ? $cand2 : $cand1;
+        }
+        return $cand1;
+    }
+
+    /**
+     * Retry в конец очереди менеджера: retry_at = max(now+delay, tail+delay)
+     */
+    public function rescheduleAtManagerTail(
+        int $id,
+        string $pbxUser,
+        int $delaySeconds,
+        string $status,
+        ?string $err,
+        bool $incPostpones,
+    ): DateTimeImmutable {
+        $base = new DateTimeImmutable("now")->modify(
+            "+{$delaySeconds} seconds",
+        );
+        $when = $this->calcTailAfter($pbxUser, $base, $delaySeconds, $id);
+
+        $this->reschedule(
+            $id,
+            $status,
+            $when,
+            $err,
+            false, // dial_attempts НЕ трогаем здесь
+            $incPostpones,
+        );
+
+        return $when;
     }
 }
