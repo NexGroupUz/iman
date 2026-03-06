@@ -67,12 +67,40 @@ function extractToken(): string
     return "";
 }
 
+function isWithinWorkingHours(
+    DateTimeImmutable $now,
+    int $startHour = 9,
+    int $endHour = 20,
+): bool {
+    // Рабочее окно: [09:00:00, 20:00:00)
+    $start = $now->setTime($startHour, 0, 0);
+    $end = $now->setTime($endHour, 0, 0);
+    return $now >= $start && $now < $end;
+}
+
 $token = extractToken();
 if (!hash_equals(Config::env("APP_WEBHOOK_TOKEN"), $token)) {
     http_response_code(403);
     header("Content-Type: application/json; charset=utf-8");
     echo json_encode(
         ["ok" => false, "error" => "forbidden"],
+        JSON_UNESCAPED_UNICODE,
+    );
+    exit();
+}
+
+$now = new DateTimeImmutable("now", new DateTimeZone("Asia/Tashkent"));
+if (!isWithinWorkingHours($now, 9, 20)) {
+    // Дропаем: не логируем в БД, не идём в Bitrix REST, ничего не создаём
+    http_response_code(200);
+    header("Content-Type: application/json; charset=utf-8");
+    echo json_encode(
+        [
+            "ok" => true,
+            "dropped" => true,
+            "reason" => "out_of_working_hours",
+            "now" => $now->format("Y-m-d H:i:s"),
+        ],
         JSON_UNESCAPED_UNICODE,
     );
     exit();
