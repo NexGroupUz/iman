@@ -160,7 +160,11 @@ try {
         $pbxUser = preg_replace("/\D+/", "", $inner) ?: "";
     }
 
-    if (!in_array($pbxUser, ["1011"])) {
+    if (
+        !in_array($pbxUser, [
+            "1110, 1116, 1117, 1005, 1072, 1119, 1120, 1121, 1118, 1123, 1124",
+        ])
+    ) {
         exit();
     }
 
